@@ -1,7 +1,8 @@
 import { FFmpeg } from '@ffmpeg/ffmpeg';
 import { fetchFile, toBlobURL } from '@ffmpeg/util';
-import { toPng } from 'html-to-image';
+import { toJpeg, toPng } from 'html-to-image';
 import { 
+  AlertTriangle,
   Download, 
   FileCode, 
   Layers, 
@@ -24,6 +25,8 @@ import { DEFAULT_HTML } from './constants';
 export default function App() {
   const [code, setCode] = useState(DEFAULT_HTML);
   const [isExporting, setIsExporting] = useState(false);
+  const [isEngineReady, setIsEngineReady] = useState(false);
+  const [isEngineLoading, setIsEngineLoading] = useState(false);
   const [progress, setProgress] = useState(0);
   const [logs, setLogs] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -37,11 +40,27 @@ export default function App() {
   const previewRef = useRef<HTMLIFrameElement>(null);
   const ffmpegRef = useRef<FFmpeg | null>(null);
 
+  // Remove redundant Prism.highlightAll() which is handled by the Editor's highlight prop
+
   useEffect(() => {
-    Prism.highlightAll();
-  }, [code]);
+    // Proactively preload FFmpeg engine on mount
+    const preload = async () => {
+      try {
+        setIsEngineLoading(true);
+        await loadFFmpeg();
+        setIsEngineReady(true);
+      } catch (err) {
+        console.error('Failed to preload FFmpeg:', err);
+      } finally {
+        setIsEngineLoading(false);
+      }
+    };
+    preload();
+  }, []);
 
   const loadFFmpeg = async () => {
+    if (ffmpegRef.current) return ffmpegRef.current;
+    
     const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm';
     const ffmpeg = new FFmpeg();
     
@@ -102,21 +121,23 @@ export default function App() {
                     }
                 `;
 
-                // Wait a tiny bit for render
-                await new Promise(r => setTimeout(r, 50));
+                // Optimized wait time for performance
+                await new Promise(r => setTimeout(r, 20));
 
-                const dataUrl = await toPng(previewDoc.body, {
+                const imgData = await toJpeg(previewDoc.body, {
                     width,
                     height,
+                    quality: 0.90, // Slightly reduced for speed
                     skipFonts: false
                 });
                 
-                await ffmpeg.writeFile(`frame${i.toString().padStart(5, '0')}.png`, await fetchFile(dataUrl));
+                await ffmpeg.writeFile(`frame${i.toString().padStart(5, '0')}.jpg`, await fetchFile(imgData));
                 
-                if (i % fps === 0) {
-                    setLogs(prev => [...prev.slice(-15), `Captured frame ${i}/${totalFrames}`]);
+                // Only update UI every 10 frames to avoid main-thread jank
+                if (i % 10 === 0 || i === totalFrames - 1) {
+                    setLogs(prev => [...prev.slice(-10), `Capture: ${Math.round((i / totalFrames) * 100)}% (${i}/${totalFrames})`]);
+                    setProgress(Math.round(((i + 1) / totalFrames) * 80));
                 }
-                setProgress(Math.round(((i + 1) / totalFrames) * 80));
             }
 
             // Stitch frames with FFmpeg
@@ -124,10 +145,11 @@ export default function App() {
             setProgress(90);
             await ffmpeg.exec([
                 '-framerate', `${fps}`,
-                '-i', 'frame%05d.png',
+                '-i', 'frame%05d.jpg',
                 '-c:v', 'libx264',
                 '-pix_fmt', 'yuv420p',
                 '-preset', 'ultrafast',
+                '-crf', '18',
                 'output.mp4'
             ]);
 
@@ -144,7 +166,7 @@ export default function App() {
             // Clean up
             for (let i = 0; i < totalFrames; i++) {
                 try {
-                    await ffmpeg.deleteFile(`frame${i.toString().padStart(5, '0')}.png`);
+                    await ffmpeg.deleteFile(`frame${i.toString().padStart(5, '0')}.jpg`);
                 } catch (e) {}
             }
             try { await ffmpeg.deleteFile('output.mp4'); } catch(e) {}
@@ -184,19 +206,30 @@ export default function App() {
         <div className="flex items-center gap-6">
           <div className="flex items-center gap-2 text-xs font-medium text-neutral-400 uppercase tracking-widest leading-none">
             <span>Engine:</span>
-            <span className="flex items-center gap-1.5 text-emerald-600">
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
-              Ready
-            </span>
+            {isEngineLoading ? (
+               <span className="flex items-center gap-1.5 text-amber-600 italic">
+                 <Loader2 className="w-3 h-3 animate-spin" />
+                 Initializing...
+               </span>
+            ) : isEngineReady ? (
+              <span className="flex items-center gap-1.5 text-emerald-600">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+                Ready
+              </span>
+            ) : (
+              <span className="flex items-center gap-1.5 text-red-600">
+                Offline
+              </span>
+            )}
           </div>
 
           <button 
             onClick={handleExport}
-            disabled={isExporting}
+            disabled={isExporting || !isEngineReady}
             className="flex items-center gap-2 bg-black text-white px-5 py-2 rounded-md text-sm font-medium hover:bg-neutral-800 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
           >
-            {isExporting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
-            {isExporting ? 'Exporting...' : 'Export MP4'}
+            {isExporting || isEngineLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
+            {isExporting ? 'Exporting...' : isEngineLoading ? 'Initializing Engine...' : 'Export MP4'}
           </button>
         </div>
       </nav>
@@ -206,6 +239,16 @@ export default function App() {
         <aside className="w-72 border-r border-neutral-200 bg-white flex flex-col p-6 gap-8 shrink-0">
           <section>
             <h3 className="text-[10px] font-bold text-neutral-400 uppercase tracking-wider mb-4 border-b border-neutral-50 pb-2">Capture Settings</h3>
+            
+            {(exportSettings.duration * exportSettings.fps > 450) && (
+              <div className="mb-4 p-3 bg-amber-50 border border-amber-200 rounded-lg flex gap-2 items-start">
+                <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                <div className="text-[10px] text-amber-800 leading-tight">
+                  <span className="font-bold">Heavy Export:</span> Rendering {exportSettings.duration * exportSettings.fps} frames may crash your browser. Consider lowering resolution or framerate.
+                </div>
+              </div>
+            )}
+
             <div className="space-y-5">
               <div className="flex flex-col gap-1.5">
                 <label className="text-[11px] font-semibold text-neutral-500 uppercase tracking-tight">Duration (Seconds)</label>
@@ -311,22 +354,47 @@ export default function App() {
                         <FileCode className="w-3.5 h-3.5" />
                         index.html
                         </div>
-                        <button 
-                        onClick={() => setCode(DEFAULT_HTML)}
-                        className="text-neutral-300 hover:text-neutral-900 transition-colors"
-                        >
-                        <RefreshCcw className="w-3.5 h-3.5" />
-                        </button>
+                        <div className="flex items-center gap-2">
+                            <button 
+                                onClick={async () => {
+                                    try {
+                                        const text = await navigator.clipboard.readText();
+                                        if (text) setCode(text);
+                                        setLogs(prev => [...prev, 'Clipboard content imported.']);
+                                    } catch (err) {
+                                        setLogs(prev => [...prev, 'WARN: Clipboard access denied. Use Ctrl+V.']);
+                                    }
+                                }}
+                                className="text-neutral-400 hover:text-neutral-900 transition-colors flex items-center gap-1.5 text-[9px] uppercase font-bold"
+                                title="Paste from clipboard"
+                            >
+                                <Layers className="w-3 h-3" />
+                                Paste
+                            </button>
+                            <button 
+                                onClick={() => {
+                                    if (confirm('Reset to default template?')) {
+                                        setCode(DEFAULT_HTML);
+                                    }
+                                }}
+                                className="text-neutral-400 hover:text-neutral-900 transition-colors"
+                            >
+                                <RefreshCcw className="w-3.5 h-3.5" />
+                            </button>
+                        </div>
                     </div>
-                    <div className="flex-1 overflow-auto">
+                    <div className="flex-1 overflow-auto bg-neutral-50/30 transition-colors focus-within:bg-white focus-within:ring-2 focus-within:ring-black/5">
                         <Editor
                         value={code}
-                        onValueChange={setCode}
+                        onValueChange={code => setCode(code)}
                         highlight={code => Prism.highlight(code, Prism.languages.markup, 'markup')}
                         padding={24}
+                        textareaId="code-editor-main"
                         className="min-h-full font-mono leading-relaxed"
                         style={{
-                            fontFamily: '"Geist Mono", "JetBrains Mono", monospace',
+                            fontFamily: '"JetBrains Mono", "Fira Code", monospace',
+                            fontSize: 13,
+                            lineHeight: '1.6',
                         }}
                         />
                     </div>
