@@ -1,0 +1,6 @@
+{
+  "name": "FlashVid - HTML to MP4 Studio",
+  "description": "Convert HTML and CSS animations into high-quality MP4 videos directly in your browser. Features a live editor, frame-by-frame rendering, and advanced export settings.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
