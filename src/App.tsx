@@ -4,14 +4,22 @@ import { toJpeg, toPng } from 'html-to-image';
 import { 
   AlertTriangle,
   Download, 
+  FastForward,
   FileCode, 
+  Fullscreen,
   Layers, 
   Loader2, 
+  Maximize,
+  Maximize2,
   Monitor, 
+  Pause,
   Play, 
   PlayCircle, 
   RefreshCcw, 
+  Rewind,
   Settings, 
+  SkipBack,
+  SkipForward,
   Video 
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
@@ -25,8 +33,12 @@ import { DEFAULT_HTML } from './constants';
 export default function App() {
   const [code, setCode] = useState(DEFAULT_HTML);
   const [isExporting, setIsExporting] = useState(false);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [isFullscreen, setIsFullscreen] = useState(false);
   const [isEngineReady, setIsEngineReady] = useState(false);
   const [isEngineLoading, setIsEngineLoading] = useState(false);
+  const [isMidiConnected, setIsMidiConnected] = useState(false);
   const [progress, setProgress] = useState(0);
   const [logs, setLogs] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -38,7 +50,9 @@ export default function App() {
   });
 
   const previewRef = useRef<HTMLIFrameElement>(null);
+  const previewContainerRef = useRef<HTMLDivElement>(null);
   const ffmpegRef = useRef<FFmpeg | null>(null);
+  const playbackIntervalRef = useRef<number | null>(null);
 
   // Remove redundant Prism.highlightAll() which is handled by the Editor's highlight prop
 
@@ -56,6 +70,134 @@ export default function App() {
       }
     };
     preload();
+  }, []);
+
+  useEffect(() => {
+    // MIDI Integration
+    if (navigator.requestMIDIAccess) {
+      navigator.requestMIDIAccess().then((access) => {
+        setIsMidiConnected(access.inputs.size > 0);
+        
+        access.onstatechange = (e) => {
+          setIsMidiConnected(access.inputs.size > 0);
+        };
+
+        const onMIDIMessage = (message: any) => {
+          const [status, data1, data2] = message.data;
+          // status 144 = Note On, 128 = Note Off, 176 = Control Change
+          
+          if ((status === 144 || status === 176) && data2 > 0) { 
+            const isNote = status === 144;
+            setLogs(prev => [...prev.slice(-15), `MIDI: ${isNote ? 'Note' : 'CC'} ${data1} [Val: ${data2}]`]);
+
+            // Map keys (Notes or CC numbers)
+            // Common mappings: CC 4 = Play/Pause, CC 5 = Next, etc.
+            // Or use Note keys for simple buttons
+            const key = isNote ? (data1 % 12) : data1;
+            
+            if (isNote) {
+              switch(key) {
+                 case 0: // C
+                    setIsPlaying(prev => !prev);
+                    break;
+                 case 2: // D
+                    setCurrentTime(prev => Math.min(exportSettings.duration, prev + 1));
+                    break;
+                 case 4: // E
+                    setCurrentTime(prev => Math.min(exportSettings.duration, prev + 0.1));
+                    break;
+                 case 5: // F
+                    setCurrentTime(prev => Math.max(0, prev - 0.1));
+                    break;
+                 case 7: // G
+                    setCurrentTime(prev => Math.min(exportSettings.duration, prev + 5));
+                    break;
+              }
+            } else {
+               // CC Mappings (Transport controls often use these)
+               switch(data1) {
+                  case 41: // Basic Play CC
+                  case 45: // Play/Pause CC
+                     setIsPlaying(prev => !prev);
+                     break;
+                  case 42: // Fast Forward CC
+                     setCurrentTime(prev => Math.min(exportSettings.duration, prev + 10));
+                     break;
+                  case 43: // Rewind CC
+                     setCurrentTime(prev => Math.max(0, prev - 10));
+                     break;
+                  case 44: // Next CC
+                     setCurrentTime(prev => Math.min(exportSettings.duration, prev + 1));
+                     break;
+               }
+            }
+          }
+        };
+
+        access.inputs.forEach((input) => {
+          input.onmidimessage = onMIDIMessage;
+        });
+      }).catch(err => console.error("MIDI Access Denied", err));
+    }
+  }, [exportSettings.duration]);
+
+  // Handle live playback loop
+  useEffect(() => {
+    if (isPlaying && !isExporting) {
+      const step = 1 / exportSettings.fps;
+      playbackIntervalRef.current = window.setInterval(() => {
+        setCurrentTime(prev => {
+          if (prev >= exportSettings.duration) {
+            return 0; // Loop
+          }
+          return prev + step;
+        });
+      }, 1000 / exportSettings.fps);
+    } else if (playbackIntervalRef.current) {
+      clearInterval(playbackIntervalRef.current);
+    }
+
+    return () => {
+      if (playbackIntervalRef.current) clearInterval(playbackIntervalRef.current);
+    };
+  }, [isPlaying, isExporting, exportSettings.fps, exportSettings.duration]);
+
+  // Sync iframe with currentTime
+  useEffect(() => {
+    const previewDoc = previewRef.current?.contentDocument || previewRef.current?.contentWindow?.document;
+    if (previewDoc) {
+      let style = previewDoc.getElementById('seek-helper') as HTMLStyleElement;
+      if (!style) {
+        style = previewDoc.createElement('style');
+        style.id = 'seek-helper';
+        previewDoc.head.appendChild(style);
+      }
+      style.innerHTML = `
+        * {
+            animation-play-state: paused !important;
+            animation-delay: -${currentTime}s !important;
+            transition: none !important;
+        }
+      `;
+    }
+  }, [currentTime, code]);
+
+  const toggleFullscreen = () => {
+    if (previewContainerRef.current) {
+      if (!document.fullscreenElement) {
+        previewContainerRef.current.requestFullscreen().then(() => setIsFullscreen(true)).catch(err => {
+          console.error(`Error attempting to enable fullscreen: ${err.message}`);
+        });
+      } else {
+        document.exitFullscreen().then(() => setIsFullscreen(false));
+      }
+    }
+  };
+
+  useEffect(() => {
+    const handleFsChange = () => setIsFullscreen(!!document.fullscreenElement);
+    document.addEventListener('fullscreenchange', handleFsChange);
+    return () => document.removeEventListener('fullscreenchange', handleFsChange);
   }, []);
 
   const loadFFmpeg = async () => {
@@ -203,7 +345,19 @@ export default function App() {
           <span className="text-[10px] font-bold text-neutral-400 border border-neutral-200 px-1.5 py-0.5 rounded ml-1">v.1.2.0</span>
         </div>
         
-        <div className="flex items-center gap-6">
+            <div className="flex items-center gap-6">
+          <div className="flex items-center gap-2 text-xs font-medium text-neutral-400 uppercase tracking-widest leading-none">
+            <span>MIDI:</span>
+            {isMidiConnected ? (
+              <span className="flex items-center gap-1.5 text-blue-600">
+                <span className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse"></span>
+                Active
+              </span>
+            ) : (
+              <span className="text-neutral-300">Off</span>
+            )}
+          </div>
+
           <div className="flex items-center gap-2 text-xs font-medium text-neutral-400 uppercase tracking-widest leading-none">
             <span>Engine:</span>
             {isEngineLoading ? (
@@ -402,13 +556,17 @@ export default function App() {
 
                 {/* Preview Panel */}
                 <div className="w-1/2 flex flex-col gap-6 overflow-hidden">
-                    <div className="flex-1 bg-[#050505] rounded-2xl shadow-2xl relative overflow-hidden flex items-center justify-center border-[6px] border-white ring-1 ring-neutral-200">
+                    <div 
+                        ref={previewContainerRef}
+                        className="flex-1 bg-[#050505] rounded-2xl shadow-2xl relative overflow-hidden flex flex-col items-center justify-center border-[6px] border-white ring-1 ring-neutral-200 group/preview"
+                    >
                         <div 
-                            className="bg-white relative overflow-hidden shrink-0" 
+                            className="bg-white relative overflow-hidden shrink-0 shadow-2xl" 
                             style={{ 
                                 width: exportSettings.width, 
                                 height: exportSettings.height,
-                                transform: `scale(${Math.min(0.4, (window.innerWidth / 3) / exportSettings.width)})`
+                                transform: isFullscreen ? 'scale(1)' : `scale(${Math.min(0.4, (window.innerWidth / 3) / exportSettings.width)})`,
+                                transition: 'transform 0.3s ease'
                             }}
                         >
                             <iframe
@@ -419,9 +577,86 @@ export default function App() {
                                 sandbox="allow-scripts allow-modals allow-popups allow-same-origin"
                             />
                         </div>
-                        <div className="absolute top-4 left-4 flex gap-2">
-                            <div className="px-2 py-1 bg-black/60 backdrop-blur-md rounded text-[9px] text-white/80 font-bold uppercase tracking-wider">Preview</div>
-                            <div className="px-2 py-1 bg-white/10 backdrop-blur-md rounded text-[9px] text-white/60 font-mono italic">{exportSettings.width}x{exportSettings.height}</div>
+                        
+                        {/* Overlay Controls */}
+                        <div className="absolute top-4 left-4 right-4 flex justify-between items-center z-20">
+                            <div className="flex gap-2">
+                                <div className="px-2 py-1 bg-black/60 backdrop-blur-md rounded text-[9px] text-white/80 font-bold uppercase tracking-wider border border-white/10">Live Preview</div>
+                                <div className="px-2 py-1 bg-black/40 backdrop-blur-md rounded text-[9px] text-white/60 font-mono italic border border-white/5">{exportSettings.width}x{exportSettings.height}</div>
+                            </div>
+                            <button 
+                                onClick={toggleFullscreen}
+                                className="p-2.5 bg-white text-black rounded-xl hover:bg-neutral-200 transition-all hover:scale-110 shadow-xl active:scale-95"
+                                title="Toggle Fullscreen View"
+                            >
+                                <Maximize2 className="w-4 h-4" />
+                            </button>
+                        </div>
+
+                        {/* Playback Controls Bar */}
+                        <div className={`absolute bottom-6 left-6 right-6 flex flex-col gap-4 transition-all duration-300 ${isFullscreen ? 'opacity-100 bg-black/40 p-6 rounded-2xl backdrop-blur-xl' : 'opacity-100 group-hover/preview:translate-y-0 translate-y-2 group-hover/preview:opacity-100 opacity-0'}`}>
+                            <div className="w-full h-1.5 bg-white/10 rounded-full overflow-hidden relative group/timeline cursor-pointer" onClick={(e) => {
+                                const rect = e.currentTarget.getBoundingClientRect();
+                                const x = e.clientX - rect.left;
+                                setCurrentTime((x / rect.width) * exportSettings.duration);
+                            }}>
+                                <div 
+                                    className="absolute h-full bg-red-600 transition-all duration-75 shadow-[0_0_8px_rgba(220,38,38,0.5)]"
+                                    style={{ width: `${(currentTime / exportSettings.duration) * 100}%` }}
+                                />
+                            </div>
+                            <div className="flex items-center justify-between">
+                                <div className="flex items-center gap-2">
+                                    <button 
+                                        onClick={() => setCurrentTime(0)} 
+                                        className="p-2 text-white/50 hover:text-white transition-all hover:bg-white/10 rounded-lg" 
+                                        title="Reset to Start"
+                                    >
+                                        <SkipBack className="w-4 h-4" />
+                                    </button>
+                                    <button 
+                                        onClick={() => setCurrentTime(prev => Math.max(0, prev - 1))} 
+                                        className="p-2 text-white/50 hover:text-white transition-all hover:bg-white/10 rounded-lg" 
+                                        title="Rewind (1s)"
+                                    >
+                                        <Rewind className="w-4 h-4" />
+                                    </button>
+                                    
+                                    <button 
+                                        onClick={() => setIsPlaying(!isPlaying)} 
+                                        className="w-12 h-12 bg-white rounded-full text-black flex items-center justify-center hover:scale-110 active:scale-95 transition-all shadow-xl shadow-black/20"
+                                    >
+                                        {isPlaying ? <Pause className="w-6 h-6 fill-current" /> : <Play className="w-6 h-6 fill-current ml-1" />}
+                                    </button>
+
+                                    <button 
+                                        onClick={() => setCurrentTime(prev => Math.min(exportSettings.duration, prev + 1))} 
+                                        className="p-2 text-white/50 hover:text-white transition-all hover:bg-white/10 rounded-lg" 
+                                        title="Forward (1s)"
+                                    >
+                                        <FastForward className="w-4 h-4" />
+                                    </button>
+                                    <button 
+                                        onClick={() => setCurrentTime(exportSettings.duration)} 
+                                        className="p-2 text-white/50 hover:text-white transition-all hover:bg-white/10 rounded-lg" 
+                                        title="Skip to End"
+                                    >
+                                        <SkipForward className="w-4 h-4" />
+                                    </button>
+                                </div>
+
+                                <div className="flex items-center gap-4">
+                                    {/* Virtual "MIDI" Status Indicator */}
+                                    <div className="hidden md:flex items-center gap-1.5 px-3 py-1 bg-white/5 rounded-full border border-white/10 shrink-0">
+                                        <div className={`w-1.5 h-1.5 rounded-full ${isMidiConnected ? 'bg-blue-500 animate-pulse' : 'bg-neutral-600'}`} />
+                                        <span className="text-[9px] font-bold text-white/40 uppercase tracking-tighter">MIDI Control</span>
+                                    </div>
+
+                                    <div className="text-[11px] font-mono text-white tabular-nums bg-black/40 px-3 py-1.5 rounded-lg border border-white/5 backdrop-blur-sm shadow-inner">
+                                        {currentTime.toFixed(2)}s <span className="text-white/30">/</span> {exportSettings.duration.toFixed(1)}s
+                                    </div>
+                                </div>
+                            </div>
                         </div>
                     </div>
 
