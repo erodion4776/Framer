@@ -163,8 +163,8 @@ export default function App() {
   }, [isPlaying, isExporting, exportSettings.fps, exportSettings.duration]);
 
   // Sync iframe with currentTime
-  useEffect(() => {
-    const previewDoc = previewRef.current?.contentDocument || previewRef.current?.contentWindow?.document;
+  const syncPreviewTime = (doc?: Document) => {
+    const previewDoc = doc || previewRef.current?.contentDocument || previewRef.current?.contentWindow?.document;
     if (previewDoc) {
       let style = previewDoc.getElementById('seek-helper') as HTMLStyleElement;
       if (!style) {
@@ -180,6 +180,10 @@ export default function App() {
         }
       `;
     }
+  };
+
+  useEffect(() => {
+    syncPreviewTime();
   }, [currentTime, code]);
 
   const toggleFullscreen = () => {
@@ -218,6 +222,20 @@ export default function App() {
     return ffmpeg;
   };
 
+  const waitForIframeLoad = (iframe: HTMLIFrameElement) => {
+    return new Promise<void>((resolve) => {
+        if (iframe.contentDocument?.readyState === 'complete') {
+            resolve();
+        } else {
+            const onLoad = () => {
+                iframe.removeEventListener('load', onLoad);
+                resolve();
+            };
+            iframe.addEventListener('load', onLoad);
+        }
+    });
+  };
+
   const handleExport = async () => {
     if (!previewRef.current) return;
     
@@ -234,10 +252,17 @@ export default function App() {
 
     try {
         const { duration, fps, width, height } = exportSettings;
-        const totalFrames = duration * fps;
+        const totalFrames = Math.ceil(duration * fps);
         const ffmpeg = ffmpegRef.current || (await loadFFmpeg());
 
-        const previewDoc = previewRef.current.contentDocument || previewRef.current.contentWindow?.document;
+        const iframe = previewRef.current;
+        
+        // Ensure iframe has the latest code and is loaded
+        setLogs(prev => [...prev, 'Waiting for document ready state...']);
+        iframe.srcdoc = code;
+        await waitForIframeLoad(iframe);
+        
+        const previewDoc = iframe.contentDocument || iframe.contentWindow?.document;
         if (!previewDoc) {
           throw new Error('Could not access preview document');
         }
@@ -252,38 +277,39 @@ export default function App() {
 
         try {
             for (let i = 0; i < totalFrames; i++) {
-                const currentTime = i / fps;
+                const stepTime = i / fps;
                 
                 // Seek CSS animations
                 style.innerHTML = `
                     * {
                         animation-play-state: paused !important;
-                        animation-delay: -${currentTime}s !important;
+                        animation-delay: -${stepTime}s !important;
                         transition: none !important;
                     }
                 `;
 
-                // Optimized wait time for performance
-                await new Promise(r => setTimeout(r, 20));
+                // Give the browser time to paint after seeking
+                // 30-40ms is safer for deterministic output on high-res
+                await new Promise(r => setTimeout(r, 40));
 
                 const imgData = await toJpeg(previewDoc.body, {
                     width,
                     height,
-                    quality: 0.90, // Slightly reduced for speed
+                    quality: 0.92,
                     skipFonts: false
                 });
                 
                 await ffmpeg.writeFile(`frame${i.toString().padStart(5, '0')}.jpg`, await fetchFile(imgData));
                 
-                // Only update UI every 10 frames to avoid main-thread jank
+                // Only update UI occasionally to keep main thread healthy
                 if (i % 10 === 0 || i === totalFrames - 1) {
-                    setLogs(prev => [...prev.slice(-10), `Capture: ${Math.round((i / totalFrames) * 100)}% (${i}/${totalFrames})`]);
-                    setProgress(Math.round(((i + 1) / totalFrames) * 80));
+                    setLogs(prev => [...prev.slice(-10), `Capture Progress: ${Math.round((i / totalFrames) * 100)}% (${i}/${totalFrames})`]);
+                    setProgress(Math.round(((i + 1) / totalFrames) * 85));
                 }
             }
 
             // Stitch frames with FFmpeg
-            setLogs(prev => [...prev, 'Encoding video with H.264...']);
+            setLogs(prev => [...prev, 'Encoding video stream...']);
             setProgress(90);
             await ffmpeg.exec([
                 '-framerate', `${fps}`,
@@ -300,10 +326,10 @@ export default function App() {
             
             const a = document.createElement('a');
             a.href = url;
-            a.download = `flashvid_${Date.now()}.mp4`;
+            a.download = `flashvid_export_${Date.now()}.mp4`;
             a.click();
 
-            setLogs(prev => [...prev, 'Export successful!']);
+            setLogs(prev => [...prev, 'Export successful! Check your downloads.']);
 
             // Clean up
             for (let i = 0; i < totalFrames; i++) {
@@ -313,22 +339,21 @@ export default function App() {
             }
             try { await ffmpeg.deleteFile('output.mp4'); } catch(e) {}
         } finally {
-            if (style.parentNode) {
+            if (previewDoc && style.parentNode) {
                 previewDoc.head.removeChild(style);
             }
         }
     } catch (err: any) {
         console.error('Export Error:', err);
         setError(err.message || 'Unknown error during export');
-        setLogs(prev => [...prev, `ERROR: ${err.message}`]);
+        setLogs(prev => [...prev, `ERROR during render: ${err.message}`]);
     } finally {
         setIsExporting(false);
         setProgress(100);
         
-        // Refresh preview after export finishes to unpause animations
-        const iframe = previewRef.current;
-        if (iframe) {
-            iframe.srcdoc = code;
+        // Refresh preview after export finishes to unpause animations and reset state
+        if (previewRef.current) {
+            previewRef.current.srcdoc = code;
         }
     }
   };
@@ -573,6 +598,10 @@ export default function App() {
                                 ref={previewRef}
                                 title="Preview"
                                 srcDoc={code}
+                                onLoad={(e) => {
+                                    const doc = e.currentTarget.contentDocument || e.currentTarget.contentWindow?.document;
+                                    if (doc) syncPreviewTime(doc);
+                                }}
                                 className="w-full h-full border-none"
                                 sandbox="allow-scripts allow-modals allow-popups allow-same-origin"
                             />
